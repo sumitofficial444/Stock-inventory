@@ -2,20 +2,25 @@ import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import {calculate} from './billing.js';
 import {cloudinaryConfigured,uploadImage} from './media.js';
+import {adminEmail,syncAdmin} from './admin.js';
 const production=process.env.NODE_ENV==='production';
-if(production&&(!process.env.MONGO_URI||!process.env.JWT_SECRET||process.env.JWT_SECRET.length<32||!cloudinaryConfigured()))throw Error('Production requires MONGO_URI, a JWT_SECRET of at least 32 characters, and all Cloudinary settings');
+if(production&&(!process.env.MONGO_URI||!cloudinaryConfigured()))throw Error('Production requires MONGO_URI and all Cloudinary settings');
 const app=express();app.disable('x-powered-by');app.set('trust proxy',1);
 app.use((req,res,next)=>{res.set({'X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','X-Frame-Options':'DENY'});if(production)res.set('Strict-Transport-Security','max-age=31536000');if(req.path.startsWith('/api'))res.set('Cache-Control','no-store');next();});
 app.use(express.json({limit:'4mb'}));
 mongoose.set('bufferCommands',false);
 await mongoose.connect(process.env.MONGO_URI||'mongodb://127.0.0.1:27017/vedant-enterprises',{serverSelectionTimeoutMS:10000,maxPoolSize:10}).catch(()=>{throw Error('Cannot connect to MongoDB. Check the server URI, database user and network access.');});
-const secret=process.env.JWT_SECRET||crypto.randomBytes(48).toString('hex');
 const User=mongoose.model('User',new mongoose.Schema({name:String,email:{type:String,unique:true},password:String,profile:{type:Object,default:{}}}));
+const sessionSchema=new mongoose.Schema({hash:{type:String,unique:true},owner:mongoose.Schema.Types.ObjectId,expiresAt:{type:Date,index:{expires:0}}});
+const Session=mongoose.model('Session',sessionSchema);
+await syncAdmin(mongoose.connection);
+const sessionHash=value=>crypto.createHash('sha256').update(value).digest('hex');
+function sessionCookie(req){return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('ve_session='))?.slice(11)||'';}
+const cookieOptions={httpOnly:true,secure:production,sameSite:'strict',path:'/'};
 const Product=mongoose.model('Product',new mongoose.Schema({owner:mongoose.Schema.Types.ObjectId,name:String,sku:String,category:String,unit:String,size:String,hsn:String,image:String,price:Number,cost:Number,stock:Number,lowStock:Number,gst:Number},{timestamps:true}));
 const invoiceSchema=new mongoose.Schema({owner:mongoose.Schema.Types.ObjectId,requestKey:String,requestHash:String,number:String,customer:String,phone:String,payment:String,business:Object,items:Array,subtotal:Number,discount:Number,discountAmount:Number,tax:Number,total:Number},{timestamps:true});
 invoiceSchema.index({owner:1,requestKey:1},{unique:true,partialFilterExpression:{requestKey:{$type:'string'}}});
@@ -25,21 +30,20 @@ app.get('/api/health',(_,res)=>res.status(mongoose.connection.readyState===1?200
 const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
 const attempts=new Map();const cleanup=setInterval(()=>{for(const [key,value] of attempts)if(value.until<Date.now())attempts.delete(key);},60000);cleanup.unref();
 app.use('/api/auth',(req,res,next)=>{const key=req.ip;const now=Date.now();let entry=attempts.get(key);if(!entry||entry.until<now){entry={count:0,until:now+15*60000};attempts.set(key,entry);}if(++entry.count>40)return res.status(429).json({error:'Too many sign-in attempts. Try again later.'});next();});
-app.post('/api/auth/:action',wrap(async(req,res)=>{
- const {name,email,password}=req.body;
+app.post('/api/auth/register',(_,res)=>res.status(403).json({error:'Private shop software. Registration is disabled.'}));
+app.post('/api/auth/login',wrap(async(req,res)=>{
+ const {email,password}=req.body;
  if(typeof email!=='string'||typeof password!=='string'||!/^\S+@\S+\.\S+$/.test(email)||password.length>72) throw Error('Enter a valid email and a password up to 72 characters');
- let user;
- if(req.params.action==='register'){
-  if(process.env.ALLOW_REGISTRATION==='false')return res.status(403).json({error:'Registration is closed. Contact the business administrator.'});
-  if(!name||password.length<8) throw Error('Enter your name and a password of at least 8 characters');
-  user=await User.create({name,email:email.toLowerCase().trim(),password:await bcrypt.hash(password,12)});
- } else if(req.params.action==='login'){
-  user=await User.findOne({email:email.toLowerCase().trim()});
-  if(!user||!await bcrypt.compare(password,user.password)) return res.status(401).json({error:'Incorrect email or password'});
- } else return res.sendStatus(404);
- res.json({token:jwt.sign({id:user.id},secret,{expiresIn:'7d'}),user:{name:user.name,email:user.email,profile:user.profile}});
+ const user=email.toLowerCase().trim()===adminEmail()?await User.findOne({email:adminEmail()}):null;
+ if(!user||!await bcrypt.compare(password,user.password))return res.status(401).json({error:'Incorrect admin email or password'});
+ const value=crypto.randomBytes(32).toString('hex');
+ const old=sessionCookie(req);if(old)await Session.deleteOne({hash:sessionHash(old)});
+ await Session.create({hash:sessionHash(value),owner:user._id,expiresAt:new Date(Date.now()+8*3600000)});
+ res.cookie('ve_session',value,{...cookieOptions,maxAge:8*3600000});
+ res.json({user:{name:user.name,email:user.email,profile:user.profile}});
 }));
-app.use('/api',wrap(async(req,res,next)=>{try{req.owner=jwt.verify((req.headers.authorization||'').replace('Bearer ',''),secret).id;}catch{return res.status(401).json({error:'Please sign in'});}next();}));
+app.post('/api/auth/logout',wrap(async(req,res)=>{const value=sessionCookie(req);if(value)await Session.deleteOne({hash:sessionHash(value)});res.clearCookie('ve_session',cookieOptions);res.json({ok:true});}));
+app.use('/api',wrap(async(req,res,next)=>{const value=sessionCookie(req);const session=value&&await Session.findOne({hash:sessionHash(value),expiresAt:{$gt:new Date()}});if(!session||!await User.exists({_id:session.owner,email:adminEmail()})){res.clearCookie('ve_session',cookieOptions);return res.status(401).json({error:'Please sign in as the Vedant administrator'});}req.owner=session.owner;next();}));
 app.post('/api/media',wrap(async(req,res)=>res.json(await uploadImage(req.body.image,req.owner))));
 app.get('/api/data',wrap(async(req,res)=>{const [user,products,invoices]=await Promise.all([User.findById(req.owner).select('-password'),Product.find({owner:req.owner}).sort({createdAt:-1}),Invoice.find({owner:req.owner}).sort({createdAt:-1})]);res.json({user,products,invoices});}));
 app.put('/api/profile',wrap(async(req,res)=>{await User.updateOne({_id:req.owner},{$set:{profile:req.body}});res.json({ok:true});}));
@@ -84,7 +88,7 @@ app.post('/api/invoices',wrap(async(req,res)=>{
 app.use('/api',(_,res)=>res.status(404).json({error:'API endpoint not found'}));
 app.use(express.static(path.resolve('dist')));app.get('*',(_,res)=>res.sendFile(path.resolve('dist/index.html')));
 app.use((err,req,res,next)=>{console.error(err.name||'Request error');res.status(err.status||400).json({error:err.code===11000?'This record already exists':err.type==='entity.too.large'?'Upload is too large':production&&/Mongo|Cast|Validation/.test(err.name)?'Invalid data or database temporarily unavailable':err.message});});
-await Promise.all([User.init(),Product.init(),Invoice.init(),Counter.init()]);
+await Promise.all([User.init(),Session.init(),Product.init(),Invoice.init(),Counter.init()]);
 const port=process.env.PORT||5051;
 if(!process.env.VERCEL){
  const server=app.listen(port,'0.0.0.0',()=>console.log(`Vedant Enterprises: http://localhost:${port}`));
