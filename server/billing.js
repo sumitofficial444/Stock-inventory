@@ -3,9 +3,12 @@ export function calculate(items, discount=0) {
   if (!Number.isFinite(discount)||discount<0||discount>100) throw Error('Discount must be 0–100%');
   const lines=items.map(i=>{
     if (![i.quantity,i.price,i.gst].every(Number.isFinite)||i.quantity<=0||i.price<0||i.gst<0||i.gst>100) throw Error('Invalid invoice values');
-    const taxable=i.quantity*i.price*(1-discount/100);
-    return {...i,taxable:Math.round(taxable*100)/100,tax:Math.round(taxable*i.gst)/100};
+    const base=Math.round((i.quantity*i.price+Number.EPSILON)*100);
+    const taxable=Math.round(base*(1-discount/100));
+    if(!Number.isSafeInteger(base)||!Number.isSafeInteger(taxable))throw Error('Invoice value is too large');
+    return {...i,base:base/100,taxable:taxable/100,tax:Math.round(taxable*i.gst/100)/100};
   });
-  const subtotal=items.reduce((s,i)=>s+i.quantity*i.price,0),tax=lines.reduce((s,i)=>s+i.tax,0);
-  return {items:lines,subtotal,discount,discountAmount:subtotal*discount/100,tax,total:Math.round((lines.reduce((s,i)=>s+i.taxable,0)+tax)*100)/100};
+  const subtotalCents=lines.reduce((s,i)=>s+Math.round(i.base*100),0),taxCents=lines.reduce((s,i)=>s+Math.round(i.tax*100),0),taxableCents=lines.reduce((s,i)=>s+Math.round(i.taxable*100),0);
+  if(!Number.isSafeInteger(subtotalCents+taxCents))throw Error('Invoice value is too large');
+  return {items:lines,subtotal:subtotalCents/100,discount,discountAmount:(subtotalCents-taxableCents)/100,tax:taxCents/100,total:(taxableCents+taxCents)/100};
 }
