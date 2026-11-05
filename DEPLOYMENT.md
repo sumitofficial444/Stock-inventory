@@ -22,6 +22,8 @@ Atlas must allow the deployed function's outbound network traffic, not just the 
 
 ## Verify deployment
 
+If the page shows `Unexpected token` and `/api/health` returns `FUNCTION_INVOCATION_FAILED`, inspect **Runtime Logs**, not successful build logs. Local `.env` values are not deployed with Git. Add all four Atlas/Cloudinary variables and the admin settings above to the **Production** environment, then redeploy the updated code. `MONGO_URI` must include the same database name as the working local `.env`; using the cluster-only URI can select a different database with no shop admin. The API startup wrapper returns a sanitized JSON configuration error instead of letting initialization exceptions become Vercel plain-text responses. `node server/vercel-smoke.js` checks the actual function entry point with the locally configured production environment.
+
 Visit /api/health: expect app=vedant-enterprises and database=connected. The root must show only the admin login screen while signed out. Log in, confirm the existing stock, upload an image, print a sample invoice, then logout and confirm private pages/API data are inaccessible. Use isolated preview data for sales tests. Local access test: node server/access-smoke.js.
 
 Deployment itself is user-managed and has not been performed here. Combined GST is implemented; complete tax invoice compliance, returns, purchase/GRN, stock history and password recovery remain pending. Rate limits are per function instance; review shared rate limiting before a wider rollout.
